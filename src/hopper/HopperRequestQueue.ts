@@ -5,7 +5,7 @@ import type {
 import { hopperOperationStage } from "./HopperOperationStage.js";
 import type { HopperBridgeEvent } from "./protocol.js";
 import {
-  HopperCancelledError,
+  hopperCancelledBySignal,
   type HopperError,
   HopperProcessError,
   HopperProtocolError,
@@ -15,12 +15,12 @@ import {
 import type { JsonValue } from "../domain/jsonValue.js";
 import { err, type Result } from "../domain/result.js";
 
-export type HopperRequestResult = Result<JsonValue, HopperError>;
+type HopperRequestResult = Result<JsonValue, HopperError>;
 
 /** Node timer ceiling; larger deadlines would be clamped instead of honored. */
 const MAX_TIMEOUT_MS = 2_147_483_647;
 
-export interface HopperRequestQueueOptions {
+interface HopperRequestQueueOptions {
   readonly signal?: AbortSignal;
   /** Caller deadline from admission, including time waiting in the FIFO. */
   readonly timeoutMs?: number;
@@ -77,7 +77,7 @@ export class HopperRequestQueue {
     options: HopperRequestQueueOptions,
   ): Promise<HopperRequestResult> {
     if (options.signal?.aborted === true)
-      return Promise.resolve(err(new HopperCancelledError()));
+      return Promise.resolve(err(hopperCancelledBySignal(options.signal)));
     const timeoutMs = options.timeoutMs;
     if (
       timeoutMs !== undefined &&
@@ -221,11 +221,6 @@ export class HopperRequestQueue {
     return this.#queue.some((entry) => entry.id === id);
   }
 
-  /** Number of caller requests waiting behind the active bridge operation. */
-  queuedCount(): number {
-    return this.#queue.length;
-  }
-
   #size(): number {
     return this.#queue.length + (this.#active === undefined ? 0 : 1);
   }
@@ -239,7 +234,11 @@ export class HopperRequestQueue {
       return;
     }
     if (entry.signal?.aborted === true) {
-      this.#settleCaller(entry, err(new HopperCancelledError()), "cancelled");
+      this.#settleCaller(
+        entry,
+        err(hopperCancelledBySignal(entry.signal)),
+        "cancelled",
+      );
       this.#drain();
       return;
     }
@@ -268,7 +267,11 @@ export class HopperRequestQueue {
     try {
       entry.transmitted = true;
       this.send(
-        { id: entry.id, method: entry.method, params: entry.params },
+        {
+          id: entry.id,
+          method: entry.method,
+          params: entry.params,
+        },
         () =>
           this.accept(
             entry.id,
@@ -316,7 +319,7 @@ export class HopperRequestQueue {
 
   #cancel(
     entry: QueuedRequest,
-    error: HopperError = new HopperCancelledError(),
+    error: HopperError = hopperCancelledBySignal(entry.signal),
   ): void {
     if (entry.callerSettled) return;
     if (this.#active === entry) {

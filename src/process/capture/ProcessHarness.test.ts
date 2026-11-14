@@ -1,11 +1,22 @@
-import { expect, it, vi } from "vitest";
+import { createTestProcessCaptureResourceScope } from "../../../tests/fixtures/processCaptureResourceScope.js";
+import { assertProcessOwnershipInspectionActive } from "../ProcessInspectionCancellation.js";
+import { expect, it, vi, onTestFinished } from "vitest";
 import { processScenarioSchema } from "../../domain/process/processScenario.js";
 import { AnalysisCapabilityUnavailableError } from "../../domain/analysisErrorCore.js";
 import {
   captureProcessScenario,
   retainRootSignaller,
 } from "./ProcessHarness.js";
-import { settleProcessCaptureJournal } from "./ProcessCaptureLifecycle.js";
+import {
+  settleProcessCaptureJournal,
+  PROCESS_CAPTURE_CLEANUP_INTERVENTION_UNKNOWN,
+  ProcessCaptureResourceScope,
+  createProcessCaptureObservationBuffer,
+  prepareProcessCapture,
+  resolveProcessResult,
+  type ProcessCaptureCleanupOutcome,
+  type ProcessCaptureCleanupHost,
+} from "./ProcessCaptureLifecycle.js";
 import { parseProcessCapture } from "../../domain/process/processCaptureParsing.js";
 import { EMPTY_PROCESS_CAPTURE_EXAMPLE } from "../../domain/process/processCaptureExample.js";
 import { projectAnalysisError } from "../../domain/analysisErrorProjection.js";
@@ -19,19 +30,12 @@ import {
   normalizeCaptureFailure,
   processCaptureCancelled,
 } from "./ProcessCaptureError.js";
-import {
-  releaseProcessResources,
-  ProcessCaptureResourceScope,
-  createProcessCaptureObservationBuffer,
-  prepareProcessCapture,
-  resolveProcessResult,
-  type ProcessCaptureCleanupHost,
-} from "./ProcessCaptureLifecycle.js";
 import { DarwinProcessOwnershipInspectionError } from "../DarwinProcessRunTokenReader.js";
 
 import {
   partialProcessCaptureObservationSchema,
   processCaptureSchema,
+  type ProcessCaptureCleanupReport,
 } from "../../domain/process/processCapture.js";
 const emptyFilesystemCoverage =
   emptyProcessCapture().truncation_details.filesystem_before;
@@ -40,8 +44,13 @@ const incompleteFilesystemCoverage = {
   enumeration_truncated: true,
   enumeration_reasons: ["identity_changed"],
 } satisfies typeof emptyFilesystemCoverage;
+const historicalCleanupOutcome = (
+  report: ProcessCaptureCleanupReport,
+): ProcessCaptureCleanupOutcome => ({ report, cleanupLease: undefined });
+
 it("retains cancellation and cleanup facts when ownership baseline inspection aborts", async () => {
   const controller = new AbortController();
+  const reason = new Error("ownership baseline caller cancellation");
   const scenario = processScenarioSchema.parse({
     executable: process.execPath,
   });
@@ -58,15 +67,17 @@ it("retains cancellation and cleanup facts when ownership baseline inspection ab
       {
         createTemporaryRoot: async () => "/fixture/allocated-root",
         captureOwnershipBaseline: async () => {
-          controller.abort();
-          controller.signal.throwIfAborted();
+          controller.abort(reason);
+          assertProcessOwnershipInspectionActive(controller.signal);
           return [];
         },
         cleanup: async () => undefined,
       },
+      createTestProcessCaptureResourceScope(),
     ),
   ).rejects.toMatchObject({
     reason: "cancelled",
+    cause: reason,
     message: "process capture was cancelled",
     cleanupReport: {
       temporary_root: { state: "cleaned", reason: null },
@@ -95,6 +106,12 @@ it("keeps prelaunch snapshot evidence and the ownership failure when root cleanu
     executable: process.execPath,
     filesystem_observation_paths: ["/fixture/root"],
   });
+  const resources = new ProcessCaptureResourceScope();
+  let cleanupDenied = true;
+  onTestFinished(async () => {
+    cleanupDenied = false;
+    await resources.close();
+  });
   try {
     await prepareProcessCapture(
       scenario,
@@ -111,9 +128,10 @@ it("keeps prelaunch snapshot evidence and the ownership failure when root cleanu
           throw ownershipFailure;
         },
         cleanup: async () => {
-          throw new Error("root removal denied");
+          if (cleanupDenied) throw new Error("root removal denied");
         },
       },
+      resources,
     );
     throw new Error("expected preparation failure");
   } catch (cause: unknown) {
@@ -192,7 +210,7 @@ it("projects complete after-snapshot metadata when a later capture stage fails",
     resolveProcessResult(
       undefined,
       new Error("capture manifest failed after final snapshot"),
-      cleanup,
+      historicalCleanupOutcome(cleanup),
       observations,
       { scenario },
     );
@@ -239,7 +257,6 @@ it("preserves the actionable Darwin ownership compiler prerequisite", () => {
     new DarwinProcessOwnershipInspectionError(
       "macOS process ownership inspection requires the Apple Swift compiler via xcrun",
     ),
-    undefined,
   );
 
   expect(normalized).toBeInstanceOf(ProcessCaptureError);
@@ -247,6 +264,22 @@ it("preserves the actionable Darwin ownership compiler prerequisite", () => {
     message:
       "macOS process ownership inspection requires the Apple Swift compiler via xcrun",
   });
+});
+
+it("settles the capture journal when the application timer is unavailable", async () => {
+  const applicationTimer = vi
+    .spyOn(globalThis, "setTimeout")
+    .mockImplementation(() => {
+      throw new Error("application timer is unavailable");
+    });
+  try {
+    await expect(
+      settleProcessCaptureJournal([], 0, 50),
+    ).resolves.toBeUndefined();
+    expect(applicationTimer).not.toHaveBeenCalled();
+  } finally {
+    applicationTimer.mockRestore();
+  }
 });
 
 it("waits for terminal observations delivered after the exit callback", async () => {
@@ -308,15 +341,11 @@ it("keeps empty cleanup exception messages actionable in the report", async () =
       cleaned: false,
       reason: "unused process cleanup",
     }),
-    verifyTokenOwnedProcesses: async () => ({
-      cleaned: false,
-      reason: "unused process cleanup",
-    }),
     removeTemporaryRoot: async () => {
       throw new Error("");
     },
   };
-  const report = await releaseProcessResources({
+  const outcome = await new ProcessCaptureResourceScope().release({
     timers: new Set(),
     terminal: undefined,
     renderer: undefined,
@@ -325,135 +354,88 @@ it("keeps empty cleanup exception messages actionable in the report", async () =
     host,
   });
 
-  expect(report.temporary_root).toEqual({ state: "failed", reason: "Error" });
+  expect(outcome.report.temporary_root).toEqual({
+    state: "failed",
+    reason: "Error",
+  });
 });
 
-it.each(["termination", "verification"] as const)(
-  "retains observations and retries the temporary root when process %s throws",
-  async (stage) => {
-    const cleanupFailure = new Error(`${stage} inspection failed`);
-    const removeTemporaryRoot = vi.fn(async () => undefined);
-    let failing = true;
-    const scope = new ProcessCaptureResourceScope();
-    const host: ProcessCaptureCleanupHost = {
-      platform: "linux",
-      cleanupProcessGroup: async () => {
-        if (failing && stage === "termination") throw cleanupFailure;
-        return {
-          cleaned: true,
-          signaled: true,
-          unverified: failing
-            ? [{ pid: 900, diagnostic: "environment unavailable" }]
-            : [],
-        };
-      },
-      verifyTokenOwnedProcesses: async () => {
-        if (failing) throw cleanupFailure;
-        return { cleaned: true, signaled: false };
-      },
-      removeTemporaryRoot,
-    };
-    const cleanup = await scope.release({
-      timers: new Set(),
-      terminal: { pid: 321 },
-      renderer: undefined,
-      runId: "fixture-run",
-      temporaryRoot: "/fixture/root",
-      host,
-    });
+it("retains observations and retries the temporary root when process cleanup throws", async () => {
+  const cleanupFailure = new Error("termination inspection failed");
+  let rootRemovalFails = true;
+  const removeTemporaryRoot = vi.fn(async () => {
+    if (rootRemovalFails) throw new Error("root removal denied");
+  });
+  let failing = true;
+  const scope = new ProcessCaptureResourceScope();
+  const host: ProcessCaptureCleanupHost = {
+    platform: "linux",
+    cleanupProcessGroup: async () => {
+      if (failing) throw cleanupFailure;
+      return { cleaned: true, signaled: true };
+    },
+    removeTemporaryRoot,
+  };
+  const cleanup = await scope.release({
+    timers: new Set(),
+    terminal: { pid: 321 },
+    renderer: undefined,
+    runId: "fixture-run",
+    temporaryRoot: "/fixture/root",
+    host,
+  });
 
-    expect(removeTemporaryRoot).not.toHaveBeenCalled();
-    expect(cleanup.temporary_root).toEqual({
-      state: "unverified",
-      reason: `temporary root retained because owned process cleanup is failed: ${cleanupFailure.message}`,
-    });
-    expect(cleanup.owned_process_group).toMatchObject({
-      state: "failed",
-      reason: cleanupFailure.message,
-    });
-    if (stage === "verification")
-      expect(cleanup.owned_process_group.unverified_processes).toEqual([
-        { pid: 900, reason: "environment unavailable" },
-      ]);
-
-    const executionFailure = new Error("capture snapshot failed");
-    const capture = parseProcessCapture({
-      ...accountFullyObservedProcessCapture({
-        ...emptyProcessCapture(),
-        frames: [{ sequence: 0, at_ms: 0, data: "collected before failure" }],
-      }),
-      event_journal: [],
-    });
-    try {
-      resolveProcessResult(capture, executionFailure, cleanup);
-      throw new Error("expected cleanup failure");
-    } catch (cause: unknown) {
-      if (!(cause instanceof ProcessCaptureError)) throw cause;
-      expect(cause.cause).toBe(executionFailure);
-      expect(
-        analysisErrorProjectionSchema.parse(projectAnalysisError(cause)),
-      ).toMatchObject({
-        code: "cleanup_incomplete",
-        details: {
-          cleanup_report: cleanup,
-          execution_failure: "capture snapshot failed",
-          partial_observation: {
-            capture: { frames: [{ data: "collected before failure" }] },
-          },
-        },
-      });
-    }
-    failing = false;
-    await scope.retryCleanup();
-    expect(removeTemporaryRoot).toHaveBeenCalledExactlyOnceWith(
-      "/fixture/root",
-    );
-    await scope.close();
-    expect(removeTemporaryRoot).toHaveBeenCalledTimes(1);
-  },
-);
-
-it("waits for token-owned processes to exit after one cleanup signal", async () => {
-  vi.useFakeTimers();
+  expect(removeTemporaryRoot).not.toHaveBeenCalled();
+  expect(cleanup.report.temporary_root).toEqual({
+    state: "unverified",
+    reason: `temporary root retained because owned process cleanup is failed: ${cleanupFailure.message}`,
+  });
+  expect(cleanup.report.owned_process_group).toMatchObject({
+    state: "failed",
+    reason: cleanupFailure.message,
+  });
+  expect(cleanup.cleanupLease?.cleanupResources).toEqual([
+    "owned_process_group",
+    "/fixture/root",
+  ]);
+  const executionFailure = new Error("capture snapshot failed");
+  const capture = parseProcessCapture({
+    ...accountFullyObservedProcessCapture({
+      ...emptyProcessCapture(),
+      frames: [{ sequence: 0, at_ms: 0, data: "collected before failure" }],
+    }),
+    event_journal: [],
+  });
   try {
-    let verificationCalls = 0;
-    const exitsAt = Date.now() + 50;
-    let cleanupCalls = 0;
-    const host: ProcessCaptureCleanupHost = {
-      platform: "linux",
-      cleanupProcessGroup: async () => {
-        cleanupCalls += 1;
-        return { cleaned: true, signaled: true };
+    resolveProcessResult(capture, executionFailure, cleanup);
+    throw new Error("expected cleanup failure");
+  } catch (cause: unknown) {
+    if (!(cause instanceof ProcessCaptureError)) throw cause;
+    expect(cause.cause).toBe(executionFailure);
+    expect(
+      analysisErrorProjectionSchema.parse(projectAnalysisError(cause)),
+    ).toMatchObject({
+      code: "cleanup_incomplete",
+      details: {
+        resources: ["owned_process_group", "/fixture/root"],
+        cleanup_report: cleanup.report,
+        execution_failure: "capture snapshot failed",
+        partial_observation: {
+          capture: { frames: [{ data: "collected before failure" }] },
+        },
       },
-      verifyTokenOwnedProcesses: async () => {
-        verificationCalls += 1;
-        return Date.now() < exitsAt
-          ? { cleaned: false, reason: "owned process is exiting" }
-          : { cleaned: true, signaled: false };
-      },
-      removeTemporaryRoot: async () => undefined,
-    };
-    const result = releaseProcessResources({
-      timers: new Set(),
-      terminal: { pid: 321 },
-      renderer: undefined,
-      runId: "fixture-run",
-      temporaryRoot: "/fixture/root",
-      host,
     });
-
-    await vi.runAllTimersAsync();
-    const report = await result;
-
-    expect(report.owned_process_group).toEqual({
-      state: "cleaned",
-      reason: null,
-    });
-    expect(cleanupCalls).toBe(1);
-    expect(verificationCalls).toBeGreaterThan(1);
-  } finally {
-    vi.useRealTimers();
   }
+  failing = false;
+  await expect(scope.retryCleanup()).rejects.toMatchObject({
+    cleanupResources: ["/fixture/root"],
+  });
+  expect(cleanup.cleanupLease?.cleanupResources).toEqual(["/fixture/root"]);
+  rootRemovalFails = false;
+  await scope.retryCleanup();
+  expect(removeTemporaryRoot).toHaveBeenCalledWith("/fixture/root");
+  await scope.close();
+  expect(removeTemporaryRoot).toHaveBeenCalledTimes(2);
 });
 
 it("retains unrelated withheld processes through cleanup, capture, and JSON", async () => {
@@ -464,16 +446,12 @@ it("retains unrelated withheld processes through cleanup, capture, and JSON", as
       signaled: true,
       unverified: [
         { pid: 900, diagnostic: "platform_binary_environment_withheld" },
+        { pid: 901, diagnostic: "foreign uid: EINVAL" },
       ],
-    }),
-    verifyTokenOwnedProcesses: async () => ({
-      cleaned: true,
-      signaled: false,
-      unverified: [{ pid: 901, diagnostic: "foreign uid: EINVAL" }],
     }),
     removeTemporaryRoot: async () => undefined,
   };
-  const report = await releaseProcessResources({
+  const outcome = await new ProcessCaptureResourceScope().release({
     timers: new Set(),
     terminal: { pid: 321 },
     renderer: undefined,
@@ -485,7 +463,7 @@ it("retains unrelated withheld processes through cleanup, capture, and JSON", as
     { pid: 900, reason: "platform_binary_environment_withheld" },
     { pid: 901, reason: "foreign uid: EINVAL" },
   ];
-  expect(report.owned_process_group).toEqual({
+  expect(outcome.report.owned_process_group).toEqual({
     state: "cleaned",
     reason: null,
     unverified_processes: unverified,
@@ -493,7 +471,7 @@ it("retains unrelated withheld processes through cleanup, capture, and JSON", as
   const original = emptyProcessCapture();
   const { cleanup: previousCleanup, ...pending } = original;
   for (const input of [pending, original]) {
-    const resolved = resolveProcessResult(input, undefined, report);
+    const resolved = resolveProcessResult(input, undefined, outcome);
     const serialized: unknown = JSON.parse(JSON.stringify(resolved));
     const capture = parseProcessCapture(serialized);
     expect(capture.cleanup).toEqual({
@@ -502,6 +480,7 @@ it("retains unrelated withheld processes through cleanup, capture, and JSON", as
     });
     expect(capture.residual_unknowns).toEqual([
       ...original.residual_unknowns,
+      PROCESS_CAPTURE_CLEANUP_INTERVENTION_UNKNOWN,
       {
         scope: "process",
         reason: expect.stringContaining("900 could not be verified"),
@@ -511,52 +490,6 @@ it("retains unrelated withheld processes through cleanup, capture, and JSON", as
         reason: expect.stringContaining("901 could not be verified"),
       },
     ]);
-  }
-});
-
-it("retains the last ownership failure when the verification grace expires", async () => {
-  vi.useFakeTimers();
-  try {
-    let verificationCalls = 0;
-    let cleanupCalls = 0;
-    const host: ProcessCaptureCleanupHost = {
-      platform: "linux",
-      cleanupProcessGroup: async () => {
-        cleanupCalls += 1;
-        return { cleaned: true, signaled: true };
-      },
-      verifyTokenOwnedProcesses: async () => {
-        verificationCalls += 1;
-        return {
-          cleaned: false,
-          reason:
-            verificationCalls === 1
-              ? "owned process has not exited yet"
-              : "owned process remained after identity recheck",
-        };
-      },
-      removeTemporaryRoot: async () => undefined,
-    };
-    const result = releaseProcessResources({
-      timers: new Set(),
-      terminal: { pid: 322 },
-      renderer: undefined,
-      runId: "fixture-run",
-      temporaryRoot: "/fixture/root",
-      host,
-    });
-
-    await vi.runAllTimersAsync();
-    const report = await result;
-
-    expect(report.owned_process_group).toEqual({
-      state: "unverified",
-      reason: "owned process remained after identity recheck",
-    });
-    expect(cleanupCalls).toBe(1);
-    expect(verificationCalls).toBeGreaterThan(1);
-  } finally {
-    vi.useRealTimers();
   }
 });
 
@@ -571,14 +504,10 @@ it("passes sampled detached groups into cleanup even when their token is unknown
         reason: "sampled group has no verifiable run token",
       };
     },
-    verifyTokenOwnedProcesses: async () => ({
-      cleaned: true,
-      signaled: false,
-    }),
     removeTemporaryRoot: async () => undefined,
   };
 
-  const report = await releaseProcessResources({
+  const outcome = await new ProcessCaptureResourceScope().release({
     timers: new Set(),
     terminal: { pid: 321 },
     renderer: undefined,
@@ -589,7 +518,7 @@ it("passes sampled detached groups into cleanup even when their token is unknown
   });
 
   expect(sampledGroups).toEqual([654]);
-  expect(report.owned_process_group).toEqual({
+  expect(outcome.report.owned_process_group).toEqual({
     state: "unverified",
     reason: "sampled group has no verifiable run token",
   });
@@ -630,7 +559,11 @@ it("retains observations and both causes when process cleanup is unverifiable", 
 
   let error: ProcessCaptureError | undefined;
   try {
-    resolveProcessResult(capture, executionFailure, cleanup);
+    resolveProcessResult(
+      capture,
+      executionFailure,
+      historicalCleanupOutcome(cleanup),
+    );
   } catch (cause: unknown) {
     if (!(cause instanceof ProcessCaptureError)) throw cause;
     error = cause;
@@ -700,7 +633,11 @@ it("projects execution and cleanup failures when capture never completed", () =>
 
   let error: ProcessCaptureError | undefined;
   try {
-    resolveProcessResult(undefined, executionFailure, cleanup);
+    resolveProcessResult(
+      undefined,
+      executionFailure,
+      historicalCleanupOutcome(cleanup),
+    );
   } catch (cause: unknown) {
     if (!(cause instanceof ProcessCaptureError)) throw cause;
     error = cause;
@@ -735,7 +672,11 @@ it("retains completed observations when finalization fails after clean cleanup",
 
   let error: ProcessCaptureError | undefined;
   try {
-    resolveProcessResult(capture, executionFailure, cleanup);
+    resolveProcessResult(
+      capture,
+      executionFailure,
+      historicalCleanupOutcome(cleanup),
+    );
   } catch (cause: unknown) {
     if (!(cause instanceof ProcessCaptureError)) throw cause;
     error = cause;
@@ -773,41 +714,67 @@ it("retains completed observations when finalization fails after clean cleanup",
   ).toBe(true);
 });
 
-it("preserves cancellation while projecting observations and successful cleanup", () => {
-  const capture = parseProcessCapture({
-    ...accountFullyObservedProcessCapture({
-      ...emptyProcessCapture(),
-      frames: [{ sequence: 0, at_ms: 0, data: "observed before cancellation" }],
-    }),
-    event_journal: [],
-  });
-  const cleanup = {
-    owned_process_group: { state: "cleaned" as const, reason: null },
-    terminal_renderer: { state: "cleaned" as const, reason: null },
-    temporary_root: { state: "cleaned" as const, reason: null },
-  };
-  let error: ProcessCaptureError | undefined;
-  try {
-    resolveProcessResult(capture, processCaptureCancelled(), cleanup);
-  } catch (cause: unknown) {
-    if (!(cause instanceof ProcessCaptureError)) throw cause;
-    error = cause;
-  }
-  if (error === undefined) throw new Error("expected cancellation");
-
-  expect(projectAnalysisError(error)).toMatchObject({
-    code: "cancelled",
-    message: "Process capture was cancelled. Start it again when ready.",
-    details: {
-      operation: "process_capture",
-      cleanup: "complete",
-      cleanup_report: cleanup,
-      partial_observation: {
-        capture: { frames: [{ data: "observed before cancellation" }] },
+it.each([false, true])(
+  "preserves finalization cancellation alongside cleanup intervention=%s",
+  async (signaled) => {
+    const capture = parseProcessCapture({
+      ...accountFullyObservedProcessCapture({
+        ...emptyProcessCapture(),
+        frames: [
+          { sequence: 0, at_ms: 0, data: "observed before cancellation" },
+        ],
+      }),
+      event_journal: [],
+    });
+    const cleanup = await new ProcessCaptureResourceScope().release({
+      timers: new Set(),
+      terminal: { pid: 321 },
+      renderer: undefined,
+      runId: "finalization-cancellation",
+      temporaryRoot: "/fixture/root",
+      host: {
+        platform: "linux",
+        cleanupProcessGroup: async () => ({ cleaned: true, signaled }),
+        removeTemporaryRoot: async () => undefined,
       },
-    },
-  });
-});
+    });
+    const reason = { request: "cancel after resource cleanup" };
+    let error: ProcessCaptureError | undefined;
+    try {
+      resolveProcessResult(capture, processCaptureCancelled(reason), cleanup);
+    } catch (cause: unknown) {
+      if (!(cause instanceof ProcessCaptureError)) throw cause;
+      error = cause;
+    }
+    if (error === undefined) throw new Error("expected cancellation");
+
+    expect(error.cause).toBe(reason);
+    expect(projectAnalysisError(error)).toMatchObject({
+      code: "cancelled",
+      message: expect.stringMatching(/process capture.*cancelled.*again/iu),
+      details: {
+        operation: "process_capture",
+        cleanup: "complete",
+        cleanup_report: cleanup.report,
+        partial_observation: {
+          capture: {
+            frames: [{ data: "observed before cancellation" }],
+            settlement: {
+              cleanup_outcome: signaled ? "cleaned" : "not_required",
+            },
+            ...(signaled
+              ? {
+                  residual_unknowns: expect.arrayContaining([
+                    PROCESS_CAPTURE_CLEANUP_INTERVENTION_UNKNOWN,
+                  ]),
+                }
+              : {}),
+          },
+        },
+      },
+    });
+  },
+);
 
 it("fails closed on Windows before resolving or launching scenario paths", async () => {
   const scenario = processScenarioSchema.parse({

@@ -1,13 +1,11 @@
 import type { AnalysisError } from "../domain/analysisErrorBase.js";
-import {
-  AnalysisCancelledError,
-  AnalysisResourceConstraintError,
-} from "../domain/analysisErrorCore.js";
+import { AnalysisResourceConstraintError } from "../domain/analysisErrorCore.js";
 import type { JsonValue } from "../domain/jsonValue.js";
-import type { FunctionDossier } from "../domain/hopperValues.js";
+import type { FunctionDossier } from "../domain/native/functionDossier.js";
 import type { RelationshipCoverage } from "../domain/relationshipCoverage.js";
 import { ProviderAdapterError } from "../domain/providerAdapterError.js";
 import { err, ok, type Result } from "../domain/result.js";
+import { kunaProjectDeadline } from "./KunaConfiguration.js";
 import type { KunaInstallation } from "./KunaInstallation.js";
 import {
   KUNA_XREF_OUTPUT_BYTES,
@@ -93,16 +91,13 @@ export class KunaReferenceQueries {
   ): Promise<Result<KunaCallGraph, AnalysisError>> {
     if (this.#graphFailure !== undefined) return err(this.#graphFailure);
     if (this.#graph === undefined) {
-      if (this.#pendingGraph?.controller.signal.aborted === true) {
-        const retired = await this.work.wait(
+      if (this.#pendingGraph?.signal.aborted === true) {
+        const retired = await this.work.retire(
           this.#pendingGraph,
           signal,
           operation,
         );
-        if (!retired.ok && !(retired.error instanceof AnalysisCancelledError))
-          return retired;
-        if (signal?.aborted === true)
-          return err(new AnalysisCancelledError(operation));
+        if (!retired.ok) return retired;
         return this.#loadGraph(installation, operation, signal);
       }
       if (this.#pendingGraph === undefined) {
@@ -118,7 +113,7 @@ export class KunaReferenceQueries {
                   "--functions",
                   "",
                 ],
-                timeoutMs: installation.configuration.projectTimeoutMs,
+                deadline: kunaProjectDeadline(installation.configuration),
               },
               new KunaCallGraphReader(),
               producerSignal,
@@ -169,6 +164,18 @@ export class KunaReferenceQueries {
           },
         };
       });
+    const calleeDiscovery =
+      node.kind === "data"
+        ? {
+            discovery: {
+              callees: {
+                status: "partial" as const,
+                reason:
+                  "Kuna classifies this graph node as data and does not analyze it as a function body.",
+              },
+            },
+          }
+        : {};
     return ok({
       callers: identities(graph.callers.get(address) ?? []),
       callees: identities(graph.callees.get(address) ?? []),
@@ -188,8 +195,9 @@ export class KunaReferenceQueries {
             limitations: [
               "Kuna reports indirect calls in this function without every target; additional callees remain unknown.",
             ],
+            ...calleeDiscovery,
           }
-        : { status: "complete" },
+        : { status: "complete", ...calleeDiscovery },
       source: this.#source(graph, node),
     });
   }
@@ -205,6 +213,7 @@ export class KunaReferenceQueries {
       has_indirect_calls: graph.hasIndirectCalls,
       function: {
         address: node.address,
+        kind: node.kind,
         has_indirect_calls: node.hasIndirectCalls,
         forwards_to: node.forwardsTo,
         forwarding_target_in_graph:
@@ -225,12 +234,9 @@ export class KunaReferenceQueries {
       return ok(cached);
     }
     let pending = this.#pendingXrefs.get(address);
-    if (pending?.controller.signal.aborted === true) {
-      const retired = await this.work.wait(pending, signal, "xrefs");
-      if (!retired.ok && !(retired.error instanceof AnalysisCancelledError))
-        return retired;
-      if (signal?.aborted === true)
-        return err(new AnalysisCancelledError("xrefs"));
+    if (pending?.signal.aborted === true) {
+      const retired = await this.work.retire(pending, signal, "xrefs");
+      if (!retired.ok) return retired;
       return this.incoming(installation, address, signal);
     }
     if (pending === undefined) {
@@ -249,7 +255,7 @@ export class KunaReferenceQueries {
             installation,
             operation: "xrefs",
             arguments: (input) => ["xrefs", input, "--to", address, "--json"],
-            timeoutMs: installation.configuration.projectTimeoutMs,
+            deadline: kunaProjectDeadline(installation.configuration),
             outputBytes: KUNA_XREF_OUTPUT_BYTES,
             signal: producerSignal,
           });
@@ -301,15 +307,22 @@ export class KunaReferenceQueries {
   }
 
   #parsed<T>(
-    parsed: Result<T, string>,
+    parsed: Result<
+      T,
+      { readonly code: string; readonly field?: string | undefined }
+    >,
     label: string,
   ): Result<T, AnalysisError> {
-    return parsed.ok
-      ? parsed
-      : err(
-          new ProviderAdapterError(KUNA_PROVIDER_ID, "kuna:references", {
-            userMessage: `Kuna's ${label} cannot be used: ${parsed.error}`,
-          }),
-        );
+    if (parsed.ok) return parsed;
+    const { code, field } = parsed.error;
+    return err(
+      new ProviderAdapterError(KUNA_PROVIDER_ID, "kuna:references", {
+        diagnostics: {
+          code,
+          ...(field === undefined ? {} : { field }),
+        },
+        userMessage: `Kuna's ${label} cannot be used: ${code}`,
+      }),
+    );
   }
 }

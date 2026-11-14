@@ -1,3 +1,4 @@
+import { KunaDocumentError } from "./KunaDocumentError.js";
 import { KUNA_STRING_MIN_LENGTH } from "./KunaLimits.js";
 import { accessSync, constants, statSync } from "node:fs";
 
@@ -16,9 +17,18 @@ import {
 import type { BinaryTarget } from "../domain/binaryTargetTypes.js";
 import { err, ok } from "../domain/result.js";
 import { RegularFileCleanupFailure } from "../filesystem/OwnedRegularFile.js";
+import {
+  resolveRegexMatchingDeadline,
+  type RegexMatchingDeadline,
+} from "../config/regexMatchingDeadline.js";
+import {
+  resolveRegexWorkerHeapRequest,
+  type RegexWorkerHeapRequest,
+} from "../config/regexWorkerHeapRequest.js";
 import { snapshotEnvironment } from "../process/snapshotEnvironment.js";
 import {
   kunaFileCleanupError,
+  kunaRetainedResourceCleanupError,
   type KunaProcessLauncher,
 } from "./KunaCommand.js";
 import {
@@ -26,15 +36,18 @@ import {
   type KunaConfiguration,
 } from "./KunaConfiguration.js";
 import {
-  createKunaFileCloseScope,
+  createKunaResourceScope,
   inspectKunaInstallation,
 } from "./KunaInstallation.js";
 import { KunaProjectCache } from "./KunaProjectCache.js";
+import { kunaCapabilities } from "./KunaProviderCapabilities.js";
+import { KUNA_PROVIDER_IDENTITY } from "./KunaProviderMetadata.js";
 import {
-  KUNA_PROVIDER_IDENTITY,
-  kunaCapabilities,
-} from "./KunaProviderCapabilities.js";
-import { KUNA_COMMAND_REMEDIATION, KUNA_PROVIDER_ID } from "./KunaRelease.js";
+  KUNA_COMMAND_REMEDIATION,
+  KUNA_RELEASE_VERIFICATION_EXPLANATION,
+  KUNA_UNVERIFIED_VERSION_REMEDIATION,
+  KUNA_VERIFIED_VERSION,
+} from "./KunaRelease.js";
 import { KunaRunSlots } from "./KunaRunSlots.js";
 import { KunaSessionClient } from "./KunaSessionClient.js";
 import { kunaUnavailable } from "./KunaUnavailable.js";
@@ -52,6 +65,8 @@ const VERIFIED_ARCHITECTURES: ReadonlySet<string> = new Set([
  */
 export class KunaProvider implements AnalysisProviderCandidate {
   readonly #environment: Readonly<NodeJS.ProcessEnv>;
+  readonly #deadline: RegexMatchingDeadline;
+  readonly #heapRequest: RegexWorkerHeapRequest;
   readonly #platform: NodeJS.Platform;
   readonly #launcher: KunaProcessLauncher | undefined;
   readonly #singleFunctionRuns: number | undefined;
@@ -65,10 +80,26 @@ export class KunaProvider implements AnalysisProviderCandidate {
       readonly launcher?: KunaProcessLauncher;
       /** Test seam for foreground native runs; production derives it from the host. */
       readonly singleFunctionRuns?: number;
+      /**
+       * Deadline already resolved at startup. Omitted means resolve the
+       * selected environment; an invalid setting is refused.
+       */
+      readonly regexMatchingDeadline?: RegexMatchingDeadline;
+      /**
+       * Heap request already resolved at startup. Omitted means resolve the
+       * selected environment; an invalid setting is refused.
+       */
+      readonly regexWorkerHeapRequest?: RegexWorkerHeapRequest;
     } = {},
   ) {
     this.#platform = options.platform ?? process.platform;
     this.#environment = snapshotEnvironment(environment, this.#platform);
+    this.#deadline =
+      options.regexMatchingDeadline ??
+      resolveRegexMatchingDeadline(this.#environment);
+    this.#heapRequest =
+      options.regexWorkerHeapRequest ??
+      resolveRegexWorkerHeapRequest(this.#environment);
     this.#launcher = options.launcher;
     this.#singleFunctionRuns = options.singleFunctionRuns;
   }
@@ -78,15 +109,10 @@ export class KunaProvider implements AnalysisProviderCandidate {
   }
 
   capabilities() {
-    const availability = this.inspectAvailability();
     return kunaCapabilities(
-      availability.status === "available"
-        ? { available: true }
-        : {
-            available: false,
-            reason: availability.reason,
-            code: availability.code,
-          },
+      this.inspectAvailability(),
+      this.#deadline,
+      this.#heapRequest,
     );
   }
 
@@ -100,6 +126,7 @@ export class KunaProvider implements AnalysisProviderCandidate {
         status: "unavailable",
         code: configuration.error.code,
         reason: configuration.error.reason,
+        remediation: configuration.error.remediation,
         diagnostics: {
           configured: configuration.error.code !== "not_configured",
           version_probed: false,
@@ -108,12 +135,14 @@ export class KunaProvider implements AnalysisProviderCandidate {
     const { command } = configuration.value;
     try {
       accessSync(command, constants.X_OK);
-      if (!statSync(command).isFile()) throw new Error("not a regular file");
+      if (!statSync(command).isFile())
+        throw new KunaDocumentError("command_not_file");
     } catch (cause: unknown) {
       return {
         status: "unavailable",
         code: "executable_missing",
         reason: `Cannot execute REA_KUNA_COMMAND ${command}: ${cause instanceof Error ? cause.message : String(cause)}. ${KUNA_COMMAND_REMEDIATION}`,
+        remediation: KUNA_COMMAND_REMEDIATION,
         diagnostics: { configured: true, command, version_probed: false },
       };
     }
@@ -168,43 +197,84 @@ export class KunaProvider implements AnalysisProviderCandidate {
     options?: AnalysisProfileResolutionOptions,
   ) {
     if (options?.signal?.aborted === true)
-      return err(new AnalysisCancelledError("kuna:profile"));
+      return err(
+        new AnalysisCancelledError("kuna:profile", {
+          cause: options.signal.reason,
+        }),
+      );
     let installation: Awaited<ReturnType<typeof inspectKunaInstallation>>;
-    const fileCloseResources = options?.fileCloseResources;
-    if (fileCloseResources === undefined)
+    const resourceScope = options?.resourceScope;
+    if (resourceScope === undefined)
       return err(
         kunaUnavailable(
           "kuna:profile",
-          "Kuna profile inspection requires a durable file resource owner",
+          "Kuna profile inspection requires a durable resource scope",
         ),
       );
-    const fileCloseScope = createKunaFileCloseScope(fileCloseResources);
+    const kunaResources = createKunaResourceScope(resourceScope);
     try {
       installation = await inspectKunaInstallation(this.#environment, {
         platform: this.#platform,
         ...(options?.signal === undefined ? {} : { signal: options.signal }),
-        fileCloseResources: fileCloseScope.owner,
+        resourceScope: kunaResources.owner,
+        ...(this.#launcher === undefined
+          ? {}
+          : { processLauncher: this.#launcher }),
       });
     } catch (cause: unknown) {
-      if (!(cause instanceof RegularFileCleanupFailure)) throw cause;
-      const error = kunaFileCleanupError(
+      const retainedCleanup = kunaRetainedResourceCleanupError(
         cause,
         "kuna:profile",
-        options?.signal,
       );
-      fileCloseScope.bindFailure(cause, error);
+      if (retainedCleanup !== undefined) return err(retainedCleanup);
+      if (!(cause instanceof RegularFileCleanupFailure)) {
+        const cancellation = kunaResources.installationCancellationError(
+          cause,
+          "kuna:profile",
+        );
+        if (cancellation !== undefined) return err(cancellation);
+      }
+      if (!(cause instanceof RegularFileCleanupFailure)) throw cause;
+      const error = kunaFileCleanupError(cause, "kuna:profile");
+      kunaResources.bindFailure(cause, error);
       return err(error);
     }
-    if (!installation.ok)
-      return err(kunaUnavailable("open_binary", installation.error.reason));
+    if (!installation.ok) {
+      const error = kunaUnavailable("open_binary", installation.error.reason, {
+        diagnostics: installation.error.diagnostics,
+        ...(!kunaResources.hasPending
+          ? {}
+          : {
+              cleanup: {
+                reason: "Kuna version-probe process cleanup is unconfirmed.",
+                resources: kunaResources.cleanupResources ?? [],
+              },
+            }),
+      });
+      kunaResources.bindRetainedFailure(error);
+      return err(error);
+    }
     const { value } = installation;
     return ok({
+      releaseVerification: {
+        status: value.verified
+          ? ("verified" as const)
+          : ("unverified" as const),
+        basis: "reported_version" as const,
+        reported_version: value.version,
+        verified_version: KUNA_VERIFIED_VERSION,
+        explanation: KUNA_RELEASE_VERIFICATION_EXPLANATION,
+        remediation: value.verified
+          ? null
+          : KUNA_UNVERIFIED_VERSION_REMEDIATION,
+      },
       profile: createAnalysisProfile(
         { ...KUNA_PROVIDER_IDENTITY, version: value.version },
         {
           kuna_version: value.version,
           kuna_sha256: value.sha256,
-          verified_release: value.verified,
+          kuna_command: value.configuration.command,
+          kuna_executable: value.executable,
           jobs: value.configuration.jobs,
           export: "decompile-project",
           reference_graph: {
@@ -212,8 +282,14 @@ export class KunaProvider implements AnalysisProviderCandidate {
             schema_version: 4,
             bodies: false,
             edge_kind: "call",
+            discovery: "body-classification-v1",
           },
-          xrefs: { command: "xrefs", direction: "to", exact_address: true },
+          xrefs: {
+            command: "xrefs",
+            direction: "to",
+            exact_address: true,
+            stored_pointers: true,
+          },
           strings: {
             command: "strings",
             encoding: "all",
@@ -221,6 +297,7 @@ export class KunaProvider implements AnalysisProviderCandidate {
             termination: "any",
             xrefs: false,
           },
+          value_flow: "explicitly-unavailable-v1",
           cache_policy: "live",
         },
       ),
@@ -254,6 +331,8 @@ export class KunaProvider implements AnalysisProviderCandidate {
       cache: this.#projectCache(configuration.value),
       runSlots: this.#foregroundSlots(configuration.value),
       environment: this.#environment,
+      deadline: this.#deadline,
+      heapRequest: this.#heapRequest,
       ...(this.#launcher === undefined ? {} : { launcher: this.#launcher }),
     });
   }

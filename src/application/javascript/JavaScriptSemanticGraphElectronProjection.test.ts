@@ -1,5 +1,5 @@
 import { expect, it } from "vitest";
-import { analyzeJavaScriptStaticSource } from "../../domain/javascript/javascriptStaticAnalysis.js";
+import { analyzeJavaScriptStaticSource } from "../../../tests/fixtures/javascriptStaticAnalysis.js";
 import { analyzeJavaScriptSemantics } from "../../domain/javascript/javascriptSemanticAnalysis.js";
 import type { JavaScriptArtifactFile } from "../../domain/javascript/javascriptArtifactFiles.js";
 import { projectJavaScriptSemanticFileSteps } from "./JavaScriptSemanticGraphBuilder.js";
@@ -24,7 +24,7 @@ const project = (budget: number) => {
   const steps = projectJavaScriptSemanticFileSteps(
     file,
     ir,
-    budget,
+    { nodes: budget, unknowns: budget },
     facts.electron.call_paths,
   );
   let result = steps.next();
@@ -35,7 +35,7 @@ const project = (budget: number) => {
 it("retains Electron calls before library definitions consume the node budget", () => {
   const result = project(20);
   expect(result.nodes).toHaveLength(20);
-  expect(result.truncated).toBe(true);
+  expect(result.nodesTruncated).toBe(true);
   const terminal = result.nodes.find(
     (node) => node.label === "ipc-event.sender.copy",
   );
@@ -59,7 +59,7 @@ it("retains Electron calls before library definitions consume the node budget", 
 it("reports truncation and keeps referential integrity even within a boundary path", () => {
   const result = project(3);
   expect(result.nodes).toHaveLength(3);
-  expect(result.truncated).toBe(true);
+  expect(result.nodesTruncated).toBe(true);
   expect(
     result.nodes.some((node) => node.label === "ipc-event.sender.copy"),
   ).toBe(false);

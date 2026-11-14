@@ -92,11 +92,9 @@ it("observes a real Node Inspector and releases attachments after cancellation a
   const before = attachments();
   const controller = new AbortController();
   const cancelled = expect(
-    client.callTool(
-      {
-        name: "observe_javascript_runtime",
-        arguments: { ...request, observation_ms: 10_000 },
-      },
+    call(
+      "observe_javascript_runtime",
+      { ...request, observation_ms: 10_000 },
       { signal: controller.signal },
     ),
   ).rejects.toThrow("cancel live observation");
@@ -124,4 +122,4 @@ it("observes a real Node Inspector and releases attachments after cancellation a
       details: { reason: "endpoint_unreachable" },
     },
   });
-}, 30_000);
+});

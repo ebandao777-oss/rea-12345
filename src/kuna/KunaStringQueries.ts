@@ -1,3 +1,4 @@
+import type { RegexConfigurationSnapshot } from "../process/RegexMatcher.js";
 import type { AnalysisError } from "../domain/analysisErrorBase.js";
 import {
   AnalysisCancelledError,
@@ -5,18 +6,19 @@ import {
 } from "../domain/analysisErrorCore.js";
 import {
   analysisSearchPredicate,
-  analysisSearchQuerySchema,
+  type AnalysisSearchQuery,
 } from "../domain/analysisSearch.js";
-import { analysisInputErrorFromIssues } from "../domain/inputIssueProjection.js";
 import type { JsonValue } from "../domain/jsonValue.js";
 import { err, ok, type Result } from "../domain/result.js";
 import { normalizeKunaAddress } from "./KunaAddress.js";
+import { kunaProjectDeadline } from "./KunaConfiguration.js";
 import type { KunaInstallation } from "./KunaInstallation.js";
 import type { KunaPendingQuery, KunaQueryWork } from "./KunaQueryWork.js";
 import { kunaQueryFailureForCaller } from "./KunaQueryErrors.js";
 import { KUNA_STRING_MIN_LENGTH } from "./KunaLimits.js";
 import {
   KunaStringInventoryReader,
+  kunaStringsAtAddress,
   type KunaStringInventory,
   type KunaStringItem,
 } from "./KunaStringInventory.js";
@@ -34,6 +36,8 @@ export class KunaStringQueries {
     parameters: Readonly<Record<string, JsonValue>>,
     installation: KunaInstallation,
     signal: AbortSignal | undefined,
+    query: AnalysisSearchQuery | undefined,
+    regex: RegexConfigurationSnapshot | undefined,
   ): Promise<
     Result<
       { readonly result: JsonValue; readonly source: JsonValue },
@@ -41,14 +45,8 @@ export class KunaStringQueries {
     >
   > {
     if (signal?.aborted === true)
-      return err(new AnalysisCancelledError(operation));
-    const query =
-      operation === "search_strings"
-        ? analysisSearchQuerySchema.safeParse(parameters)
-        : undefined;
-    if (query !== undefined && !query.success)
       return err(
-        analysisInputErrorFromIssues(operation, query.error.issues, parameters),
+        new AnalysisCancelledError(operation, { cause: signal?.reason }),
       );
     const address =
       operation === "list_strings" && parameters.address !== undefined
@@ -60,32 +58,37 @@ export class KunaStringQueries {
       address === undefined
     )
       return err(
-        new AnalysisInputError(operation, {
-          userMessage: "Use an explicit hexadecimal u64 string address.",
-        }),
+        new AnalysisInputError(
+          operation,
+          { userMessage: "Use an explicit hexadecimal u64 string address." },
+          [{ path: ["address"], reason: "invalid_format" }],
+        ),
       );
     const inventory = await this.#load(installation, operation, signal);
     if (!inventory.ok)
       return err(kunaQueryFailureForCaller(inventory.error, operation));
     if (this.#cancelled(signal))
-      return err(new AnalysisCancelledError(operation));
+      return err(
+        new AnalysisCancelledError(operation, { cause: signal?.reason }),
+      );
     const available = inventory.value.items;
     let items: KunaStringItem[] | undefined;
     if (address !== undefined)
-      items = available.filter((item) => item.address === address);
-    if (query?.success === true) {
-      if (query.data.mode === "regex") {
+      items = kunaStringsAtAddress(inventory.value, address);
+    if (query !== undefined) {
+      if (query.mode === "regex") {
         const matched = await this.work.match({
           operation,
-          pattern: query.data.pattern,
-          caseSensitive: query.data.case_sensitive,
+          pattern: query.pattern,
+          caseSensitive: query.case_sensitive,
           values: () => available.map((item) => item.value),
           signal,
+          ...regex,
         });
         if (!matched.ok) return matched;
         items = matched.value.map((index) => available[index]!);
       } else {
-        const predicate = analysisSearchPredicate(query.data);
+        const predicate = analysisSearchPredicate(query);
         items = available.filter((item) => predicate(item.value));
       }
     }
@@ -114,12 +117,9 @@ export class KunaStringQueries {
   ): Promise<Result<KunaStringInventory, AnalysisError>> {
     if (this.#inventory !== undefined) return ok(this.#inventory);
     if (this.#failure !== undefined) return err(this.#failure);
-    if (this.#pending?.controller.signal.aborted === true) {
-      const stopped = await this.work.wait(this.#pending, signal, operation);
-      if (!stopped.ok && !(stopped.error instanceof AnalysisCancelledError))
-        return stopped;
-      if (signal?.aborted === true)
-        return err(new AnalysisCancelledError(operation));
+    if (this.#pending?.signal.aborted === true) {
+      const stopped = await this.work.retire(this.#pending, signal, operation);
+      if (!stopped.ok) return stopped;
       return this.#load(installation, operation, signal);
     }
     if (this.#pending === undefined) {
@@ -141,7 +141,7 @@ export class KunaStringQueries {
                 "any",
                 "--no-xrefs",
               ],
-              timeoutMs: installation.configuration.projectTimeoutMs,
+              deadline: kunaProjectDeadline(installation.configuration),
             },
             new KunaStringInventoryReader(),
             producerSignal,

@@ -5,9 +5,41 @@ import {
   type SpawnOptionsWithoutStdio,
 } from "node:child_process";
 
-import { test as base } from "vitest";
+import { TestRunner, test as base } from "vitest";
 
 const SHUTDOWN_GRACE_MS = 1_000;
+/** Minimum time kept back from a test deadline to stop a child and report it. */
+const MIN_REPORT_RESERVE_MS = 5_000;
+
+/**
+ * Default child deadline: the test's remaining deadline, less a reserve for
+ * stopping the child and reporting its captured output. A hung child then fails
+ * with its output instead of an opaque test timeout, without a fixed value that
+ * assumes a host's speed. Undefined when the test itself has no deadline.
+ */
+export const remainingProcessDeadline = (
+  testDeadlineMs: number,
+  elapsedMs: number,
+): number | undefined => {
+  if (!(testDeadlineMs > 0)) return undefined;
+  const reserve = Math.max(MIN_REPORT_RESERVE_MS, testDeadlineMs / 10);
+  return Math.max(
+    SHUTDOWN_GRACE_MS,
+    Math.floor(testDeadlineMs - elapsedMs - reserve),
+  );
+};
+
+/**
+ * Deadline left for a child started by the running test, or undefined outside
+ * a test. Uses the real clock, so tests that fake `Date` keep a real deadline.
+ */
+const currentTestProcessDeadline = (): number | undefined => {
+  const test = TestRunner.getCurrentTest();
+  const started = test?.result?.startTime;
+  if (test === undefined || started === undefined) return undefined;
+  const now = performance.timeOrigin + performance.now();
+  return remainingProcessDeadline(test.timeout, now - started);
+};
 
 /** Captured output and termination state from one child process. */
 export interface ProcessResult {
@@ -70,8 +102,17 @@ const stopChild = async (
   return waitForExit(child, SHUTDOWN_GRACE_MS);
 };
 
-/** Create a child-process registry for a fixture composition root. */
-export const createTestProcessRegistry = (): TestProcesses => {
+/**
+ * Create a child-process registry for a fixture composition root. A run without
+ * its own `timeoutMs` is bounded by the running test's remaining deadline.
+ */
+export const createTestProcessRegistry = (
+  spawnChild: (
+    command: string,
+    arguments_: readonly string[],
+    options: SpawnOptionsWithoutStdio,
+  ) => ChildProcessWithoutNullStreams = nodeSpawn,
+): TestProcesses => {
   const children = new Set<ChildProcessWithoutNullStreams>();
 
   const spawn = (
@@ -79,7 +120,7 @@ export const createTestProcessRegistry = (): TestProcesses => {
     arguments_: readonly string[],
     options: SpawnOptionsWithoutStdio = {},
   ): ChildProcessWithoutNullStreams => {
-    const child = nodeSpawn(command, arguments_, {
+    const child = spawnChild(command, arguments_, {
       ...options,
       stdio: ["pipe", "pipe", "pipe"],
     });
@@ -92,7 +133,11 @@ export const createTestProcessRegistry = (): TestProcesses => {
   return {
     spawn,
     run: async (command, arguments_, options = {}) => {
-      const { input, timeoutMs, ...spawnOptions } = options;
+      const {
+        input,
+        timeoutMs = currentTestProcessDeadline(),
+        ...spawnOptions
+      } = options;
       const child = spawn(command, arguments_, spawnOptions);
       const stdout: Buffer[] = [];
       const stderr: Buffer[] = [];
@@ -103,20 +148,44 @@ export const createTestProcessRegistry = (): TestProcesses => {
 
       let timedOut = false;
       let killTimeout: NodeJS.Timeout | undefined;
+      let closeTimeout: NodeJS.Timeout | undefined;
+      let rejectUnclosed: ((error: Error) => void) | undefined;
+      const captured = (): ProcessResult => ({
+        exitCode: child.exitCode,
+        signal: child.signalCode,
+        stdout: Buffer.concat(stdout).toString("utf8"),
+        stderr: Buffer.concat(stderr).toString("utf8"),
+      });
+      const timeoutFailure = (): Error =>
+        new Error(`Test process exceeded its ${timeoutMs}ms deadline`, {
+          cause: captured(),
+        });
       const timeout =
         timeoutMs === undefined
           ? undefined
           : setTimeout(() => {
               timedOut = true;
-              child.kill("SIGTERM");
+              if (child.exitCode === null && child.signalCode === null) {
+                child.kill("SIGTERM");
+              }
               killTimeout = setTimeout(() => {
-                child.kill("SIGKILL");
+                if (child.exitCode === null && child.signalCode === null) {
+                  child.kill("SIGKILL");
+                }
+                closeTimeout = setTimeout(() => {
+                  // An inherited output pipe may stay open after the leader exits.
+                  rejectUnclosed?.(timeoutFailure());
+                  child.stdout.destroy();
+                  child.stderr.destroy();
+                }, SHUTDOWN_GRACE_MS);
+                closeTimeout.unref();
               }, SHUTDOWN_GRACE_MS);
               killTimeout.unref();
             }, timeoutMs);
       timeout?.unref();
 
       const result = await new Promise<ProcessResult>((resolve, reject) => {
+        rejectUnclosed = reject;
         child.once("error", reject);
         child.once("close", (exitCode, signal) =>
           resolve({
@@ -129,6 +198,7 @@ export const createTestProcessRegistry = (): TestProcesses => {
       }).finally(() => {
         if (timeout !== undefined) clearTimeout(timeout);
         if (killTimeout !== undefined) clearTimeout(killTimeout);
+        if (closeTimeout !== undefined) clearTimeout(closeTimeout);
       });
       if (timedOut) {
         throw new Error(`Test process exceeded its ${timeoutMs}ms deadline`, {

@@ -1,10 +1,22 @@
 import { createHash } from "node:crypto";
 
-import type { ManagedMetadataLayout } from "./ManagedMetadataLayout.js";
-import { managedFailure } from "./ManagedReaderFailure.js";
+import { jsonStringByteLength } from "../domain/jsonStringByteLength.js";
 
-/** Per-inspection capacity for eagerly retained metadata and its JSON projection. */
-const MAX_METADATA_REPRESENTATION_BYTES = 64 * 1024 * 1024;
+import type { ManagedMetadataLayout } from "./ManagedMetadataLayout.js";
+import { ManagedReaderFailure } from "./ManagedReaderFailure.js";
+import { DEFAULT_MANAGED_REPRESENTATION_BYTES } from "../domain/managed/managedInspectionLimits.js";
+
+/** The capacity owner's diagnostic, also used to admit a recovery envelope. */
+export class ManagedRepresentationFailure extends ManagedReaderFailure {
+  constructor(offset: number | null, maximumBytes: number) {
+    super({
+      code: "resource-limit",
+      scope: "metadata.representation",
+      detail: `Managed metadata exceeds max_metadata_representation_bytes=${String(maximumBytes)} bytes. Increase max_metadata_representation_bytes on the next inspection (CLI --max-metadata-representation-bytes), or select fewer type_names for member inspection. No REA restart is required; snapshot, transport and host memory limits are independent.`,
+      offset,
+    });
+  }
+}
 
 interface CachedString {
   readonly value: string;
@@ -13,12 +25,20 @@ interface CachedString {
 
 /** The layout owns decoding capacity and heap identity for all of its consumers. */
 export class ManagedDecodeBudget {
-  #remaining = MAX_METADATA_REPRESENTATION_BYTES;
+  #remaining: number;
   #transient = 0;
   readonly #rows = new Map<number, Set<number>>();
   readonly #strings = new Map<number, CachedString>();
   readonly #digests = new WeakMap<ArrayBufferLike, Map<string, string>>();
   readonly #prepaid = new WeakSet<object>();
+
+  constructor(readonly maximumBytes = DEFAULT_MANAGED_REPRESENTATION_BYTES) {
+    if (!Number.isSafeInteger(maximumBytes) || maximumBytes < 1)
+      throw new RangeError(
+        "max_metadata_representation_bytes must be a positive safe integer",
+      );
+    this.#remaining = maximumBytes;
+  }
 
   reserve(bytes: number, offset: number | null): void {
     this.#admit(bytes, offset);
@@ -54,12 +74,7 @@ export class ManagedDecodeBudget {
       bytes < 0 ||
       bytes > this.#remaining - this.#transient
     )
-      throw managedFailure(
-        "resource-limit",
-        "metadata.representation",
-        `Managed metadata exceeds the ${String(MAX_METADATA_REPRESENTATION_BYTES)} byte representation budget`,
-        offset,
-      );
+      throw new ManagedRepresentationFailure(offset, this.maximumBytes);
   }
 
   /** UTF-8 cannot decode to more UTF-16 units than bytes; JSON uses at most six bytes per unit. */
@@ -124,32 +139,10 @@ export const managedDecodeBudget = (
   return budget;
 };
 
-/** Exact UTF-8 bytes of a JSON string literal, counted without serializing it. */
-export const managedJsonStringBytes = (value: string): number => {
-  let bytes = 2;
-  for (let index = 0; index < value.length; index++) {
-    const unit = value.charCodeAt(index);
-    if (unit === 0x22 || unit === 0x5c) bytes += 2;
-    else if (unit < 0x20)
-      bytes += [0x08, 0x09, 0x0a, 0x0c, 0x0d].includes(unit) ? 2 : 6;
-    else if (unit < 0x80) bytes += 1;
-    else if (unit < 0x800) bytes += 2;
-    else if (unit >= 0xd800 && unit <= 0xdbff) {
-      const next = value.charCodeAt(index + 1);
-      if (next >= 0xdc00 && next <= 0xdfff) {
-        bytes += 4;
-        index++;
-      } else bytes += 6;
-    } else if (unit >= 0xdc00 && unit <= 0xdfff) bytes += 6;
-    else bytes += 3;
-  }
-  return bytes;
-};
-
 /** Exact UTF-8 JSON bytes of a decoded scalar or key, including escapes. */
 const jsonBytes = (item: unknown): number =>
   typeof item === "string"
-    ? managedJsonStringBytes(item)
+    ? jsonStringByteLength(item)
     : Buffer.byteLength(JSON.stringify(item) ?? "null");
 
 /**
